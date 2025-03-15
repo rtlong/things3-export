@@ -5,3 +5,6 @@
 /things2taskpaper.spec
 /build
 /things2taskpaper-debug.spec
+.devenv
+.direnv
+main.sqlite

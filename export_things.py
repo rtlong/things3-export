@@ -1,10 +1,11 @@
 import argparse
-from datetime import datetime
+from datetime import datetime, date
 import logging
 import os
 import re
 import sqlite3
 import sys
+from math import floor
 
 """
 Export Things 3 database to TaskPaper files
@@ -18,8 +19,8 @@ before Things 3.13 it was at
 Database Structure:
 
 - TMArea contains areas
-- TMTasks contains Projects (type=1), Tasks (type=0) and "ActionGroups" (type=2)
-- Tasks are sometimes goruped by actionGroup (i.e. headers)
+- TMTasks contains Projects (type=1), Tasks (type=0) and "headers" (type=2)
+- Tasks are sometimes goruped by header (i.e. headers)
 - some tasks have checklists (which consit of TMChecklistitems)
 
 """
@@ -32,21 +33,12 @@ def export(args):
         args.called_from_gui
     except:
         # log to file only if not called from guo
-        logging.basicConfig(filename='export.log', level=logging.ERROR)
-
-    if args.format not in [RowObject.FMT_ALL, RowObject.FMT_PROJECT, RowObject.FMT_AREA]:
-        raise Exception("unknown format %s" % args.format)
+        logging.basicConfig(filename='export.log', level=logging.DEBUG)
 
     con = sqlite3.connect(args.database)
 
     con.row_factory = sqlite3.Row
 
-    # reroute stdout
-    if args.format == RowObject.FMT_ALL and not args.stdout:
-        filename = args.target
-        if not filename.endswith('.taskpaper'):
-            filename = RowObject.FILE_TMPL % filename
-        reroute_stdout(filename)
     c = con.cursor()
     no_area = Area(dict(uuid='NULL', title='no area'), con, args)
     no_area.export()
@@ -55,20 +47,7 @@ def export(args):
         a.export()
     con.close()
 
-    if args.format == RowObject.FMT_ALL and not args.stdout:
-        sys.stdout = sys.__stdout__
-
-
-def reroute_stdout(filename, path_prefix=''):
-    print("rerouting standardout to", filename)
-    if path_prefix:
-        filename = filename.replace(r'/', '|')
-        filename = os.path.join(path_prefix, filename)
-    sys.stdout = open(filename, 'w')
-
-
 class RowObject(object):
-    PROJECT_TEMPLATE = "\n%(indent)s%(title)s:%(tags)s"
     FMT_ALL = 'all'
     FMT_PROJECT = 'project'
     FMT_AREA = 'area'
@@ -88,7 +67,7 @@ class RowObject(object):
     TEMPLATE = '%s%s'
 
     def indent_(self, level):
-        return "\t" * level
+        return "*" + "*" * level + " "
 
     @property
     def indent(self):
@@ -96,7 +75,8 @@ class RowObject(object):
 
     @property
     def notes_indent(self):
-        return self.indent_(self.level + 1)
+        return ""
+        # return " "(self.level + 1)
 
     @property
     def tags(self):
@@ -118,16 +98,6 @@ class RowObject(object):
             item = klass(row, self.con, self.args, self.level + 1)
             item.export()
 
-    FILE_TMPL = "%s.taskpaper"
-
-    def reroute_stdout(self, path_prefix):
-        filename = self.FILE_TMPL % self.title
-        reroute_stdout(filename, path_prefix)
-
-    def makedirs(self):
-        if not os.path.exists(self.path):
-            os.makedirs(self.path)
-
 
 class RowObjectWithTags(RowObject):
 
@@ -145,7 +115,7 @@ class RowObjectWithTags(RowObject):
     def tags(self):
         if len(self._tags) == 0:
             return ''
-        return ' ' + ' '.join(self._tags)
+        return ' :' + ':'.join(self._tags) + ":"
 
     def add_tag(self, tag):
         if tag not in self._tags:
@@ -153,7 +123,7 @@ class RowObjectWithTags(RowObject):
 
     def load_tags_from_db(self):
         def make_tag(title):
-            return '@' + title.replace(' ', '_').replace('-', '_')
+            return  title.replace(' ', '_').replace('-', '_')
 
         c = self.con.cursor()
         for row in c.execute(self.TAGS_QUERY % self.uuid):
@@ -163,23 +133,66 @@ class RowObjectWithTags(RowObject):
 class TaskObjects(RowObjectWithTags):
 
     task_fields = """
-        SELECT uuid, status, title, type, notes, area, dueDate, startDate, todayIndex, checklistItemsCount, stopDate
+        SELECT uuid, status, title, type, notes, area, deadline, startDate, todayIndex, checklistItemsCount, stopDate, start
         FROM TMTask
     """
 
-    def add_attributes(self):
+    def __init__(self, row, con, args, level=0):
+        super().__init__(row, con, args, level)
+        self._priority = None;
+        self._blocked = None;
+        self._idea = False;
+
+    @property
+    def org_todo_keyword(self):
+        if self._idea:
+            return "IDEA"
+        if self._blocked:
+            return "BLOCKED"
+        if self.start== 2:
+            return "LATER"
+        else:
+            return "TODO"
+
+    @property
+    def org_priority_cookie(self):
+        if self._priority is not None:
+            return " [#%(_priority)s]" % self
+        return ""
+
+    def add_tag(self, tag):
+        if tag == "Idea":
+            self._idea = True
+            return
+        if tag == "Important":
+            self._priority = 1
+            return
+        if tag == "Blocked":
+            self._blocked = True
+            return
+        super().add_tag(tag)
+
+    def parse_db_date(self, ts_int): 
+        # Things uses a bespoke numeric Date encoding 
+        DAYS = 128;
+        MONTHS = 32 * DAYS;
+        YEARS = 16 * MONTHS;
+
+        year = floor(ts_int / YEARS)
+        ts_int -= year * YEARS;
+        month = floor(ts_int / MONTHS)
+        ts_int -= month * MONTHS;
+        day = floor(ts_int / DAYS)
+
+        return date(year, month, day)
+
+
+    def print_attributes(self):
         """Add all attributes (due date, start date, today, someday etc.) as tags."""
-        if self.dueDate:
-            self.add_tag('@due(%s)' % datetime.fromtimestamp(self.dueDate).strftime("%Y-%m-%d"))
-        if self.todayIndex:
-            if self.startDate:
-                self.add_tag('@today')
-            else:
-                self.add_tag('@someday')
-        elif self.startDate:
-            self.add_tag('@startDate(%s)' % datetime.fromtimestamp(self.startDate).strftime("%Y-%m-%d"))
-        if self.stopDate:
-            self.add_tag('@done(%s)' % datetime.fromtimestamp(self.stopDate).strftime("%Y-%m-%d"))
+        if self.deadline:
+            print("DEADLINE: <%s>" % self.parse_db_date(self.deadline).strftime("%Y-%m-%d %a"))
+        if self.startDate:
+            print("SCHEDULED: <%s>" % self.parse_db_date(self.startDate).strftime("%Y-%m-%d %a"))
 
 
 class Area(RowObjectWithTags):
@@ -192,30 +205,19 @@ class Area(RowObjectWithTags):
         WHERE at.areas = '%s'
         AND at.tags = tag.uuid;
     """
+    AREA_TEMPLATE = "\n%(indent)s%(title)s:%(tags)s"
 
     def export(self):
         logging.debug("Area: %s (%s)", self.title, self.uuid)
         self.load_tags_from_db()
-        if self.args.format == RowObject.FMT_ALL:
-            next_level = 1
-            print(self.PROJECT_TEMPLATE % self)
-        elif self.args.format == RowObject.FMT_AREA:
-            # reroute stdout to a file for this area
-            self.path = self.args.target
-            self.makedirs()
-            self.reroute_stdout(self.args.target)
-            next_level = 0
-        else:
-            # set path and make folder for area
-            self.path = os.path.join(self.args.target, self.title)
-            self.makedirs()
-            next_level = 0
+        next_level = 1
+        print(self.AREA_TEMPLATE % self)
 
         c = self.con.cursor()
 
         if self.uuid == 'NULL':
             inbox = Project(dict(uuid='NULL', title='Inbox',
-                                 dueDate=None, startDate=None, stopDate=None, todayIndex=None, notes=None),
+                                 deadline=None, startDate=None, stopDate=None, todayIndex=None, notes=None, start=None),
                             self.con, self.args, self.level + 1, self)
             inbox.export()
             query = Project.PROJECTS_WITHOUT_AREA
@@ -227,8 +229,6 @@ class Area(RowObjectWithTags):
             p = Project(row, self.con, self.args, next_level, self)
             p.export()
 
-        if self.args.format == RowObject.FMT_AREA:
-            sys.stdout = sys.__stdout__
 
 
 class Project(TaskObjects):
@@ -247,6 +247,8 @@ class Project(TaskObjects):
         ORDER BY "index";
     """
 
+    PROJECT_TEMPLATE = "\n%(indent)s%(org_todo_keyword)s%(org_priority_cookie)s %(title)s%(tags)s"
+
     def __init__(self, row, con, args, level, area):
         super().__init__(row, con, args, level)
         self.area = area
@@ -254,11 +256,8 @@ class Project(TaskObjects):
     def export(self):
         logging.debug("Project: %s (%s)", self.title, self.uuid)
         self.load_tags_from_db()
-        self.add_attributes()
-        if self.args.format == RowObject.FMT_PROJECT:
-            self.reroute_stdout(self.area.path)
-        else:
-            print(self.PROJECT_TEMPLATE % self)
+        print(self.PROJECT_TEMPLATE % self)
+        self.print_attributes()
 
         if self.notes:
             self.print_notes()
@@ -268,8 +267,6 @@ class Project(TaskObjects):
         else:
             self.find_and_export_items(Task, Task.TASKS_IN_PROJECT % self.uuid)
 
-        if self.args.format == RowObject.FMT_PROJECT:
-            sys.stdout = sys.__stdout__
 
 
 class Task(TaskObjects):
@@ -293,32 +290,33 @@ class Task(TaskObjects):
         WHERE type != 1 -- find tasks and action groups
         AND project IS NULL
         AND area IS NULL
-        AND actionGroup IS NULL
+        AND heading IS NULL
         AND trashed = 0
         AND status < 2 -- whatever "1" means
         ORDER BY "index";
     """
     TASKS_IN_ACTION_GROUPS = TaskObjects.task_fields + """
         WHERE type = 0
-        AND actionGroup="%s"
+        AND heading="%s"
         AND trashed = 0
         AND status < 2 -- whatever "1" means
         ORDER BY "index";
     """
     ACTIONGROUP = 2
-    TASK_TEMPLATE = '%(indent)s- %(title)s%(tags)s'
-    ACTIONGROUP_TEMPLATE = '%(indent)s%(title)s:'
+    TASK_TEMPLATE = '%(indent)s%(org_todo_keyword)s%(org_priority_cookie)s %(title)s%(tags)s'
+    ACTIONGROUP_TEMPLATE = '%(indent)sTODO %(title)s:'
+
 
     def export(self):
-        logging.debug("Task: %s (%s) Level: %s Status: %s Type: %s", self.title, self.uuid, self.level, self.status, self.type)
+        logging.debug("Task: %s (%s) Level: %s Status: %s Type: %s, Start: %s Deadline: %s StartDate: %s", self.title, self.uuid, self.level, self.status, self.type, self.start, self.deadline, self.startDate)
         self.load_tags_from_db()
-        self.add_attributes()
         if self.type == self.ACTIONGROUP:
             # process action group (which have no notes!)
             print(self.ACTIONGROUP_TEMPLATE % self)
             self.find_and_export_items(Task, Task.TASKS_IN_ACTION_GROUPS % self.uuid)
         else:
             print(self.TASK_TEMPLATE % self)
+            self.print_attributes()
             if self.notes:
                 self.print_notes()
 
@@ -334,8 +332,21 @@ class CheckListItem(RowObject):
         ORDER BY "index"
     """
 
+    def indent_(self, level):
+        return ""
+
+    @property
+    def checkbox_status(self): 
+        if self.status > 0:
+            return "X"
+        else:
+            return " "
+
+    CHECKLIST_ITEM_TEMPLATE = '%(indent)s- [%(checkbox_status)s] %(title)s%(tags)s'
+
     def export(self):
-        print(Task.TASK_TEMPLATE % self)
+        print(self.CHECKLIST_ITEM_TEMPLATE % self)
+
 
 
 if __name__ == "__main__":
@@ -347,12 +358,6 @@ if __name__ == "__main__":
     parser.add_argument('--db', dest='database', action='store',
                         default='main.sqlite',
                         help='path to the Things3 database (default: main.sqlite)')
-    parser.add_argument('--format', dest='format', action='store',
-                        default='project',
-                        help='Define output format(area|project|all): what will be exported into one taskpaper file (default: project')
-    parser.add_argument('--stdout', dest='stdout', action='store_true',
-                        default=False,
-                        help='output to standard output instead of file (only works with format=all)')
 
     args = parser.parse_args()
     export(args)
